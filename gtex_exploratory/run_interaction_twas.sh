@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -t 0-6:00                         # Runtime in D-HH:MM format
+#SBATCH -t 0-2:00                         # Runtime in D-HH:MM format
 #SBATCH -p bch-compute                        # Partition to run in
 #SBATCH --mem=25GB 
 
@@ -20,7 +20,7 @@ date
 echo ${interaction_twas_output_stem}
 echo ${tau}
 
-python run_interaction_twas.py $pred_expresssion_output_stem $trait_sumstat_file $onek_genomes_plink_files $interaction_twas_output_stem $inf_version $tau
+python run_interaction_twas_VI.py $pred_expresssion_output_stem $trait_sumstat_file $onek_genomes_plink_files $interaction_twas_output_stem $inf_version $tau
 
 
 date

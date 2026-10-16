@@ -370,13 +370,16 @@ def compute_gene_effect_xtxs(gene_donor_genotype, genotype_indices, expression_p
 	return main_effect_xtx, interaction_effect_xtx
 
 
-def initialize_model_parameters(gene_training_data, genotype_indices, expression_pcs):
+def initialize_model_parameters(gene_training_data, genotype_indices, full_expression_pcs, expression_pcs):
 	n_genes = len(gene_training_data)
 	ordered_genes = np.sort(np.asarray([*gene_training_data]))
 	n_pcs = expression_pcs.shape[1]
+	n_environment_variables = full_expression_pcs.shape[1]
+	environment_effect_xtx = np.sum(np.square(full_expression_pcs), axis=0)
 
 
 	main_effects = []
+	environment_effects = []
 	interaction_effects = []
 	resid_expression = []
 	main_effect_xtxs = []
@@ -386,24 +389,28 @@ def initialize_model_parameters(gene_training_data, genotype_indices, expression
 		gene_donor_genotype = np.ascontiguousarray(gene_training_data[gene_id]['donor_genotype'])
 		n_gene_snps = gene_donor_genotype.shape[0]
 		gene_main_effect_xtx, gene_interaction_effect_xtx = compute_gene_effect_xtxs(gene_donor_genotype, genotype_indices, expression_pcs)
-		resid_expression.append(np.copy(gene_training_data[gene_id]['resid_expr']))
+		resid_expression.append(np.copy(gene_training_data[gene_id]['expr']))
 		main_effects.append(np.zeros(n_gene_snps))
+		environment_effects.append(np.zeros(n_environment_variables))
 		interaction_effects.append(np.zeros((n_gene_snps, n_pcs)))
 		main_effect_xtxs.append(gene_main_effect_xtx)
 		interaction_effect_xtxs.append(gene_interaction_effect_xtx)
 
 	# Hyperparameters
 	resid_variances = np.ones(n_genes)
-	main_effect_spike_prob = 0.5
-	interaction_effects_spike_probs = np.ones(n_pcs)*0.5
+	main_effect_spike_prob = 0.9
+	interaction_effects_spike_probs = np.ones(n_pcs)*0.9
 	main_effect_slab_var = .1
 	interaction_effects_slab_vars = np.ones(n_pcs)*.1
+	environment_effects_vars = np.ones(n_environment_variables)*.1
 	resid_variance_prior_shape = 1e-6
 	resid_variance_prior_scale = 1e-6
 	spike_prob_prior_alpha = 0.1
 	spike_prob_prior_beta = 0.1
 	slab_variance_prior_shape = 1e-6
 	slab_variance_prior_scale = 1e-6
+	environment_effect_variance_prior_shape = 1e-6
+	environment_effect_variance_prior_scale = 1e-6
 
 	model_parameters = {}
 	model_parameters['resid_variances'] = resid_variances
@@ -413,17 +420,23 @@ def initialize_model_parameters(gene_training_data, genotype_indices, expression
 	model_parameters['spike_prob_prior_beta'] = spike_prob_prior_beta
 	model_parameters['slab_variance_prior_shape'] = slab_variance_prior_shape
 	model_parameters['slab_variance_prior_scale'] = slab_variance_prior_scale
+	model_parameters['environment_effect_variance_prior_shape'] = environment_effect_variance_prior_shape
+	model_parameters['environment_effect_variance_prior_scale'] = environment_effect_variance_prior_scale
 	model_parameters['main_effect_spike_prob'] = main_effect_spike_prob
 	model_parameters['interaction_effects_spike_probs'] = interaction_effects_spike_probs
 	model_parameters['main_effect_slab_var'] = main_effect_slab_var
 	model_parameters['interaction_effects_slab_vars'] = interaction_effects_slab_vars
+	model_parameters['environment_effects_vars'] = environment_effects_vars
 	model_parameters['resid_expression'] = resid_expression
 	model_parameters['main_effects'] = main_effects
+	model_parameters['environment_effects'] = environment_effects
 	model_parameters['interaction_effects'] = interaction_effects
+	model_parameters['environment_effect_xtx'] = environment_effect_xtx
 	model_parameters['main_effect_xtxs'] = main_effect_xtxs
 	model_parameters['interaction_effect_xtxs'] = interaction_effect_xtxs
 	model_parameters['ordered_genes'] = ordered_genes
 	model_parameters['n_pcs'] = n_pcs
+	model_parameters['n_environment_variables'] = n_environment_variables
 
 	return model_parameters
 
@@ -453,10 +466,40 @@ def _sample_spike_slab_beta_from_sufficient_stats(xtx, xty, resid_var, spike_pro
 
 
 @njit(fastmath=True)
-def update_causal_effect_sizes_for_a_single_gene(gene_resid_expression, gene_main_effects, gene_interaction_effects, gene_donor_genotype, genotype_indices, expression_pcs, gene_main_effect_xtx, gene_interaction_effect_xtx, gene_resid_var, main_effect_spike_prob, main_effect_slab_var, interaction_effects_spike_probs, interaction_effects_slab_vars):
+def _sample_gaussian_beta_from_sufficient_stats(xtx, xty, resid_var, prior_var):
+	if prior_var < 1e-12:
+		prior_var = 1e-12
+	posterior_var = 1.0/((xtx/resid_var) + (1.0/prior_var))
+	posterior_mean = posterior_var*xty/resid_var
+	return np.random.normal(posterior_mean, np.sqrt(posterior_var))
+
+
+@njit(fastmath=True)
+def update_causal_effect_sizes_for_a_single_gene(gene_resid_expression, gene_main_effects, gene_environment_effects, gene_interaction_effects, gene_donor_genotype, genotype_indices, full_expression_pcs, expression_pcs, environment_effect_xtx, gene_main_effect_xtx, gene_interaction_effect_xtx, gene_resid_var, main_effect_spike_prob, main_effect_slab_var, environment_effects_vars, interaction_effects_spike_probs, interaction_effects_slab_vars):
 	n_snps = gene_donor_genotype.shape[0]
 	n_samples = len(genotype_indices)
+	n_environment_variables = full_expression_pcs.shape[1]
 	n_pcs = expression_pcs.shape[1]
+
+	for environment_iter in range(n_environment_variables):
+		old_beta = gene_environment_effects[environment_iter]
+		xtx = environment_effect_xtx[environment_iter]
+
+		if xtx > 0.0:
+			xty = 0.0
+			for sample_iter in range(n_samples):
+				covariate_val = full_expression_pcs[sample_iter, environment_iter]
+				xty = xty + (covariate_val*gene_resid_expression[sample_iter])
+			xty = xty + (old_beta*xtx)
+			new_beta = _sample_gaussian_beta_from_sufficient_stats(xtx, xty, gene_resid_var, environment_effects_vars[environment_iter])
+		else:
+			new_beta = 0.0
+		gene_environment_effects[environment_iter] = new_beta
+		delta_beta = old_beta - new_beta
+		if delta_beta != 0.0:
+			for sample_iter in range(n_samples):
+				covariate_val = full_expression_pcs[sample_iter, environment_iter]
+				gene_resid_expression[sample_iter] = gene_resid_expression[sample_iter] + (covariate_val*delta_beta)
 
 	for snp_iter in range(n_snps):
 		old_beta = gene_main_effects[snp_iter]
@@ -498,7 +541,7 @@ def update_causal_effect_sizes_for_a_single_gene(gene_resid_expression, gene_mai
 					covariate_val = gene_donor_genotype[snp_iter, genotype_indices[sample_iter]]*expression_pcs[sample_iter, pc_iter]
 					gene_resid_expression[sample_iter] = gene_resid_expression[sample_iter] + (covariate_val*delta_beta)
 
-	return gene_main_effects, gene_interaction_effects, gene_resid_expression
+	return gene_main_effects, gene_environment_effects, gene_interaction_effects, gene_resid_expression
 
 
 def update_residual_variance_for_a_single_gene(gene_resid_expression, resid_variance_prior_shape, resid_variance_prior_scale):
@@ -507,14 +550,15 @@ def update_residual_variance_for_a_single_gene(gene_resid_expression, resid_vari
 	return 1.0/np.random.gamma(posterior_shape, scale=(1.0/posterior_scale))
 
 
-def update_causal_effect_sizes_and_residual_variances(gene_training_data, model_parameters, genotype_indices, expression_pcs):
+def update_causal_effect_sizes_and_residual_variances(gene_training_data, model_parameters, genotype_indices, full_expression_pcs, expression_pcs):
 	# Loop through genes
 	for gene_iter, gene_name in enumerate(model_parameters['ordered_genes']):
 
 		# update causal effects for a single gene
-		updated_gene_main_effects, updated_gene_interaction_effects, updated_gene_resid_expression = update_causal_effect_sizes_for_a_single_gene(model_parameters['resid_expression'][gene_iter], model_parameters['main_effects'][gene_iter], model_parameters['interaction_effects'][gene_iter], gene_training_data[gene_name]['donor_genotype'], genotype_indices, expression_pcs, model_parameters['main_effect_xtxs'][gene_iter], model_parameters['interaction_effect_xtxs'][gene_iter], model_parameters['resid_variances'][gene_iter], model_parameters['main_effect_spike_prob'], model_parameters['main_effect_slab_var'], model_parameters['interaction_effects_spike_probs'], model_parameters['interaction_effects_slab_vars'])
+		updated_gene_main_effects, updated_gene_environment_effects, updated_gene_interaction_effects, updated_gene_resid_expression = update_causal_effect_sizes_for_a_single_gene(model_parameters['resid_expression'][gene_iter], model_parameters['main_effects'][gene_iter], model_parameters['environment_effects'][gene_iter], model_parameters['interaction_effects'][gene_iter], gene_training_data[gene_name]['donor_genotype'], genotype_indices, full_expression_pcs, expression_pcs, model_parameters['environment_effect_xtx'], model_parameters['main_effect_xtxs'][gene_iter], model_parameters['interaction_effect_xtxs'][gene_iter], model_parameters['resid_variances'][gene_iter], model_parameters['main_effect_spike_prob'], model_parameters['main_effect_slab_var'], model_parameters['environment_effects_vars'], model_parameters['interaction_effects_spike_probs'], model_parameters['interaction_effects_slab_vars'])
 		model_parameters['resid_expression'][gene_iter] = updated_gene_resid_expression
 		model_parameters['main_effects'][gene_iter] = updated_gene_main_effects
+		model_parameters['environment_effects'][gene_iter] = updated_gene_environment_effects
 		model_parameters['interaction_effects'][gene_iter] = updated_gene_interaction_effects
 
 		# Update resid variance for this gene
@@ -531,10 +575,15 @@ def update_priors(gene_training_data, model_parameters):
 	slab_shape = model_parameters['slab_variance_prior_shape']
 	slab_scale = model_parameters['slab_variance_prior_scale']
 	n_pcs = model_parameters['n_pcs']
+	n_environment_variables = model_parameters['n_environment_variables']
+	n_genes = len(model_parameters['ordered_genes'])
+	environment_effect_variance_prior_shape = model_parameters['environment_effect_variance_prior_shape']
+	environment_effect_variance_prior_scale = model_parameters['environment_effect_variance_prior_scale']
 
 	main_n_spike = 0
 	main_n_slab = 0
 	main_slab_sum_sq = 0.0
+	environment_sum_sq = np.zeros(n_environment_variables)
 	interaction_n_spike = np.zeros(n_pcs)
 	interaction_n_slab = np.zeros(n_pcs)
 	interaction_slab_sum_sq = np.zeros(n_pcs)
@@ -545,6 +594,9 @@ def update_priors(gene_training_data, model_parameters):
 		main_n_slab = main_n_slab + np.sum(main_slab_indices)
 		main_n_spike = main_n_spike + np.sum(main_slab_indices == False)
 		main_slab_sum_sq = main_slab_sum_sq + np.sum(np.square(main_effects[main_slab_indices]))
+
+		environment_effects = model_parameters['environment_effects'][gene_iter]
+		environment_sum_sq = environment_sum_sq + np.square(environment_effects)
 
 		interaction_effects = model_parameters['interaction_effects'][gene_iter]
 		for pc_iter in range(n_pcs):
@@ -561,18 +613,23 @@ def update_priors(gene_training_data, model_parameters):
 		model_parameters['interaction_effects_spike_probs'][pc_iter] = np.random.beta(spike_alpha + interaction_n_spike[pc_iter], spike_beta + interaction_n_slab[pc_iter])
 		model_parameters['interaction_effects_slab_vars'][pc_iter] = 1.0/np.random.gamma(slab_shape + (interaction_n_slab[pc_iter]/2.0), scale=(1.0/(slab_scale + (interaction_slab_sum_sq[pc_iter]/2.0))))
 
+	for environment_iter in range(n_environment_variables):
+		model_parameters['environment_effects_vars'][environment_iter] = 1.0/np.random.gamma(environment_effect_variance_prior_shape + (n_genes/2.0), scale=(1.0/(environment_effect_variance_prior_scale + (environment_sum_sq[environment_iter]/2.0))))
+
 	return model_parameters
 
-def predict_expression_levels_using_bayesian_inference(gene_training_data, genotype_indices, expression_pcs, max_iters=1000, burn_in_iters=700):
+def predict_expression_levels_using_bayesian_inference(gene_training_data, genotype_indices, full_expression_pcs, expression_pcs, max_iters=1000, burn_in_iters=700):
 	if burn_in_iters >= max_iters:
 		print('Burn-in iterations must be less than max iterations')
 		pdb.set_trace()
 
-	model_parameters = initialize_model_parameters(gene_training_data, genotype_indices, expression_pcs)
+	model_parameters = initialize_model_parameters(gene_training_data, genotype_indices, full_expression_pcs, expression_pcs)
 	posterior_main_effect_sums = []
+	posterior_environment_effect_sums = []
 	posterior_interaction_effect_sums = []
 	for gene_iter, gene_name in enumerate(model_parameters['ordered_genes']):
 		posterior_main_effect_sums.append(np.zeros(model_parameters['main_effects'][gene_iter].shape))
+		posterior_environment_effect_sums.append(np.zeros(model_parameters['environment_effects'][gene_iter].shape))
 		posterior_interaction_effect_sums.append(np.zeros(model_parameters['interaction_effects'][gene_iter].shape))
 	n_posterior_samples = 0
 
@@ -581,7 +638,7 @@ def predict_expression_levels_using_bayesian_inference(gene_training_data, genot
 	# Begin iterative algorithm
 	for itera in range(max_iters):
 		# Update causal effect sizes and residual variances
-		model_parameters = update_causal_effect_sizes_and_residual_variances(gene_training_data, model_parameters, genotype_indices, expression_pcs)
+		model_parameters = update_causal_effect_sizes_and_residual_variances(gene_training_data, model_parameters, genotype_indices, full_expression_pcs, expression_pcs)
 
 		# Update priors
 		model_parameters = update_priors(gene_training_data, model_parameters)
@@ -591,6 +648,7 @@ def predict_expression_levels_using_bayesian_inference(gene_training_data, genot
 		print('time: ' + str(t2-t1),flush=True)
 		print(model_parameters['main_effect_spike_prob'],flush=True)
 		print(model_parameters['main_effect_slab_var'],flush=True)
+		print(model_parameters['environment_effects_vars'],flush=True)
 		print(model_parameters['interaction_effects_spike_probs'],flush=True)
 		print(model_parameters['interaction_effects_slab_vars'],flush=True)
 		t1 = time.time()
@@ -598,15 +656,18 @@ def predict_expression_levels_using_bayesian_inference(gene_training_data, genot
 		if itera >= burn_in_iters:
 			for gene_iter, gene_name in enumerate(model_parameters['ordered_genes']):
 				posterior_main_effect_sums[gene_iter] = posterior_main_effect_sums[gene_iter] + model_parameters['main_effects'][gene_iter]
+				posterior_environment_effect_sums[gene_iter] = posterior_environment_effect_sums[gene_iter] + model_parameters['environment_effects'][gene_iter]
 				posterior_interaction_effect_sums[gene_iter] = posterior_interaction_effect_sums[gene_iter] + model_parameters['interaction_effects'][gene_iter]
 			n_posterior_samples = n_posterior_samples + 1
 
 	posterior_mean_effects = {}
 	posterior_mean_effects['ordered_genes'] = model_parameters['ordered_genes']
 	posterior_mean_effects['main_effects'] = []
+	posterior_mean_effects['environment_effects'] = []
 	posterior_mean_effects['interaction_effects'] = []
 	for gene_iter, gene_name in enumerate(model_parameters['ordered_genes']):
 		posterior_mean_effects['main_effects'].append(posterior_main_effect_sums[gene_iter]/n_posterior_samples)
+		posterior_mean_effects['environment_effects'].append(posterior_environment_effect_sums[gene_iter]/n_posterior_samples)
 		posterior_mean_effects['interaction_effects'].append(posterior_interaction_effect_sums[gene_iter]/n_posterior_samples)
 	posterior_mean_effects['n_posterior_samples'] = n_posterior_samples
 	return posterior_mean_effects
@@ -734,7 +795,7 @@ for chrom_num_int in range(1, 23):
 		gene_training_data[ensamble_id]['gene_symbol'] = gene_symbol
 		gene_training_data[ensamble_id]['gene_chrom'] = gene_chrom
 		gene_training_data[ensamble_id]['tss'] = tss
-		gene_training_data[ensamble_id]['resid_expr'] = residual_expr_vec
+		gene_training_data[ensamble_id]['expr'] = expr_vec
 		gene_training_data[ensamble_id]['donor_genotype'] = std_geno_mat_donor
 		gene_training_data[ensamble_id]['bim'] = gene_bim
 		gene_training_data[ensamble_id]['best_eqtl_pvalue'] = best_eqtl_pvalue
@@ -744,11 +805,12 @@ for chrom_num_int in range(1, 23):
 
 	f.close()
 
-
 '''
 gene_training_data_file = predicted_expression_dir + 'gene_training_data.pkl'
 with open(gene_training_data_file, 'wb') as output_handle:
 	pickle.dump(gene_training_data, output_handle)
+
+
 
 gene_training_data_file = predicted_expression_dir + 'gene_training_data.pkl'
 with open(gene_training_data_file, 'rb') as input_handle:
@@ -759,11 +821,10 @@ with open(gene_training_data_file, 'rb') as input_handle:
 
 
 
-
 #####################
 # (2) Run Inference
 ######################
-posterior_mean_effects = predict_expression_levels_using_bayesian_inference(gene_training_data, genotype_indices, expression_pcs, max_iters=500, burn_in_iters=400)
+posterior_mean_effects = predict_expression_levels_using_bayesian_inference(gene_training_data, genotype_indices, full_expression_pcs, expression_pcs, max_iters=600, burn_in_iters=400)
 
 
 #####################
@@ -810,7 +871,3 @@ for chrom_num_int in range(1, 23):
 
 
 	model_summary_handle.close()
-
-
-
-
